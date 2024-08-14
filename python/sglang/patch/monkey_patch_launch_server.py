@@ -1,7 +1,8 @@
-from fastapi.routing import APIRouter
-from fastapi import Request, Depends
-from functools import cache
 from argparse import ArgumentParser
+from functools import cache
+
+from fastapi import Depends, Request
+from fastapi.routing import APIRouter
 
 
 class CLIContext:

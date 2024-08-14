@@ -1,5 +1,8 @@
 """Launch the inference server."""
-from sglang.patch.monkey_patch_launch_server import patch_all; patch_all()
+
+from sglang.patch.monkey_patch_launch_server import patch_all
+
+patch_all()  # noqa: E702
 import argparse
 
 from sglang.srt.server import launch_server
