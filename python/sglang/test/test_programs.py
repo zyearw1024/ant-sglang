@@ -2,8 +2,12 @@
 
 import json
 import re
+import time
+
+import numpy as np
 
 import sglang as sgl
+from sglang.utils import download_and_cache_file, read_jsonl
 
 
 def test_few_shot_qa():
@@ -68,7 +72,7 @@ def test_select(check_answer):
         statement="The capital of Germany is Berlin.",
     )
     if check_answer:
-        assert ret["answer"] == "True", ret.text
+        assert ret["answer"] == "True", ret.text()
     else:
         assert ret["answer"] in ["True", "False", "Unknown"]
 
@@ -76,7 +80,7 @@ def test_select(check_answer):
         statement="The capital of Canada is Tokyo.",
     )
     if check_answer:
-        assert ret["answer"] == "False", ret.text
+        assert ret["answer"] == "False", ret.text()
     else:
         assert ret["answer"] in ["True", "False", "Unknown"]
 
@@ -84,7 +88,7 @@ def test_select(check_answer):
         statement="Purple is a better color than green.",
     )
     if check_answer:
-        assert ret["answer"] == "Unknown", ret.text
+        assert ret["answer"] == "Unknown", ret.text()
     else:
         assert ret["answer"] in ["True", "False", "Unknown"]
 
@@ -96,23 +100,26 @@ def test_decode_int():
         s += "The number of days in a year is " + sgl.gen_int("days") + "\n"
 
     ret = decode_int.run(temperature=0.1)
-    assert int(ret["hours"]) == 24, ret.text
-    assert int(ret["days"]) == 365, ret.text
+    assert int(ret["hours"]) == 24, ret.text()
+    assert int(ret["days"]) == 365, ret.text()
 
 
 def test_decode_json_regex():
     @sgl.function
     def decode_json(s):
-        from sglang.lang.ir import REGEX_FLOAT, REGEX_INT, REGEX_STRING
+        from sglang.lang.ir import REGEX_FLOAT, REGEX_INT, REGEX_STR
 
         s += "Generate a JSON object to describe the basic city information of Paris.\n"
+        s += "Here are the JSON object:\n"
+
+        # NOTE: we recommend using dtype gen or whole regex string to control the output
 
         with s.var_scope("json_output"):
             s += "{\n"
-            s += '  "name": ' + sgl.gen(regex=REGEX_STRING + ",") + "\n"
-            s += '  "population": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
-            s += '  "area": ' + sgl.gen(regex=REGEX_INT + ",") + "\n"
-            s += '  "latitude": ' + sgl.gen(regex=REGEX_FLOAT) + "\n"
+            s += '  "name": ' + sgl.gen(regex=REGEX_STR) + ",\n"
+            s += '  "population": ' + sgl.gen(regex=REGEX_INT, stop=[" ", "\n"]) + ",\n"
+            s += '  "area": ' + sgl.gen(regex=REGEX_INT, stop=[" ", "\n"]) + ",\n"
+            s += '  "latitude": ' + sgl.gen(regex=REGEX_FLOAT, stop=[" ", "\n"]) + "\n"
             s += "}"
 
     ret = decode_json.run(temperature=0.0)
@@ -359,6 +366,30 @@ def test_regex():
     assert re.match(regex, answer)
 
 
+def test_dtype_gen():
+    @sgl.function
+    def dtype_gen(s):
+        s += "Q: What is the full name of DNS?\n"
+        s += "A: The full nams is " + sgl.gen("str_res", dtype=str, stop="\n") + "\n"
+        s += "Q: Which year was DNS invented?\n"
+        s += "A: " + sgl.gen("int_res", dtype=int) + "\n"
+        s += "Q: What is the value of pi?\n"
+        s += "A: " + sgl.gen("float_res", dtype=float) + "\n"
+        s += "Q: Is the sky blue?\n"
+        s += "A: " + sgl.gen("bool_res", dtype=bool) + "\n"
+
+    state = dtype_gen.run()
+
+    try:
+        state["int_res"] = int(state["int_res"])
+        state["float_res"] = float(state["float_res"])
+        state["bool_res"] = bool(state["bool_res"])
+        # assert state["str_res"].startswith('"') and state["str_res"].endswith('"')
+    except ValueError:
+        print(state)
+        raise
+
+
 def test_completion_speculative():
     @sgl.function(num_api_spec_tokens=64)
     def gen_character_spec(s):
@@ -420,3 +451,102 @@ def test_chat_completion_speculative():
         )
 
     gen_character_spec().sync()
+
+
+def test_hellaswag_select():
+    """Benchmark the accuracy of sgl.select on the HellaSwag dataset."""
+
+    def get_one_example(lines, i, include_answer):
+        ret = lines[i]["activity_label"] + ": " + lines[i]["ctx"] + " "
+        if include_answer:
+            ret += lines[i]["endings"][lines[i]["label"]]
+        return ret
+
+    def get_few_shot_examples(lines, k):
+        ret = ""
+        for i in range(k):
+            ret += get_one_example(lines, i, True) + "\n\n"
+        return ret
+
+    # Read data
+    url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
+    filename = download_and_cache_file(url)
+    lines = list(read_jsonl(filename))
+
+    # Construct prompts
+    num_questions = 200
+    num_shots = 20
+    few_shot_examples = get_few_shot_examples(lines, num_shots)
+
+    questions = []
+    choices = []
+    labels = []
+    for i in range(len(lines[:num_questions])):
+        questions.append(get_one_example(lines, i, False))
+        choices.append(lines[i]["endings"])
+        labels.append(lines[i]["label"])
+    arguments = [{"question": q, "choices": c} for q, c in zip(questions, choices)]
+
+    #####################################
+    ######### SGL Program Begin #########
+    #####################################
+
+    import sglang as sgl
+
+    @sgl.function
+    def few_shot_hellaswag(s, question, choices):
+        s += few_shot_examples + question
+        s += sgl.select("answer", choices=choices)
+
+    #####################################
+    ########## SGL Program End ##########
+    #####################################
+
+    # Run requests
+    tic = time.time()
+    rets = few_shot_hellaswag.run_batch(
+        arguments,
+        temperature=0,
+        num_threads=64,
+        progress_bar=True,
+    )
+    preds = [choices[i].index(rets[i]["answer"]) for i in range(len(rets))]
+    latency = time.time() - tic
+
+    # Compute accuracy
+    accuracy = np.mean(np.array(preds) == np.array(labels))
+
+    return accuracy, latency
+
+
+def test_gen_min_new_tokens():
+    """
+    Validate sgl.gen(min_tokens) functionality.
+
+    The test asks a question where, without a min_tokens constraint, the generated answer is expected to be short.
+    By enforcing the min_tokens parameter, we ensure the generated answer has at least the specified number of tokens.
+    We verify that the number of tokens in the answer is >= the min_tokens threshold.
+    """
+    import sglang as sgl
+    from sglang.srt.hf_transformers_utils import get_tokenizer
+
+    model_path = sgl.global_config.default_backend.endpoint.get_model_name()
+    MIN_TOKENS, MAX_TOKENS = 64, 128
+
+    @sgl.function
+    def convo_1(s):
+        s += sgl.user("What is the capital of the United States?")
+        s += sgl.assistant(
+            sgl.gen("answer", min_tokens=MIN_TOKENS, max_tokens=MAX_TOKENS)
+        )
+
+    def assert_min_tokens(tokenizer, text):
+        token_ids = tokenizer.encode(text)
+        assert (
+            len(token_ids) >= MIN_TOKENS
+        ), f"Generated {len(token_ids)} tokens, min required: {MIN_TOKENS}. Text: {text}"
+
+    tokenizer = get_tokenizer(model_path)
+
+    state = convo_1.run()
+    assert_min_tokens(tokenizer, state["answer"])

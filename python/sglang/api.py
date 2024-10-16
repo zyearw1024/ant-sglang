@@ -33,11 +33,21 @@ def function(
 
 
 def Runtime(*args, **kwargs):
-    # Avoid importing unnecessary dependency
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+    # Avoid importing unnecessary dependency
     from sglang.srt.server import Runtime
 
     return Runtime(*args, **kwargs)
+
+
+def Engine(*args, **kwargs):
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+    # Avoid importing unnecessary dependency
+    from sglang.srt.server import Engine
+
+    return Engine(*args, **kwargs)
 
 
 def set_default_backend(backend: BaseBackend):
@@ -48,6 +58,10 @@ def flush_cache(backend: Optional[BaseBackend] = None):
     backend = backend or global_config.default_backend
     if backend is None:
         return False
+
+    # If backend is Runtime
+    if hasattr(backend, "endpoint"):
+        backend = backend.endpoint
     return backend.flush_cache()
 
 
@@ -55,16 +69,23 @@ def get_server_args(backend: Optional[BaseBackend] = None):
     backend = backend or global_config.default_backend
     if backend is None:
         return None
+
+    # If backend is Runtime
+    if hasattr(backend, "endpoint"):
+        backend = backend.endpoint
     return backend.get_server_args()
 
 
 def gen(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
+    min_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
+    stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
+    min_p: Optional[float] = None,
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
@@ -72,10 +93,11 @@ def gen(
     logprob_start_len: Optional[int] = None,
     top_logprobs_num: Optional[int] = None,
     return_text_in_logprobs: Optional[bool] = None,
-    dtype: Optional[type] = None,
+    dtype: Optional[Union[type, str]] = None,
     choices: Optional[List[str]] = None,
     choices_method: Optional[ChoicesSamplingMethod] = None,
     regex: Optional[str] = None,
+    json_schema: Optional[str] = None,
 ):
     """Call the model to generate. See the meaning of the arguments in docs/en/sampling_params.md"""
 
@@ -97,10 +119,13 @@ def gen(
     return SglGen(
         name,
         max_tokens,
+        min_tokens,
         stop,
+        stop_token_ids,
         temperature,
         top_p,
         top_k,
+        min_p,
         frequency_penalty,
         presence_penalty,
         ignore_eos,
@@ -110,6 +135,7 @@ def gen(
         return_text_in_logprobs,
         dtype,
         regex,
+        json_schema,
     )
 
 
@@ -117,9 +143,11 @@ def gen_int(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
+    stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
+    min_p: Optional[float] = None,
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
@@ -131,10 +159,13 @@ def gen_int(
     return SglGen(
         name,
         max_tokens,
+        None,
         stop,
+        stop_token_ids,
         temperature,
         top_p,
         top_k,
+        min_p,
         frequency_penalty,
         presence_penalty,
         ignore_eos,
@@ -151,9 +182,11 @@ def gen_string(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
+    stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
+    min_p: Optional[float] = None,
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
@@ -165,10 +198,13 @@ def gen_string(
     return SglGen(
         name,
         max_tokens,
+        None,
         stop,
+        stop_token_ids,
         temperature,
         top_p,
         top_k,
+        min_p,
         frequency_penalty,
         presence_penalty,
         ignore_eos,

@@ -15,30 +15,32 @@ limitations under the License.
 
 """DetokenizerManager is a process that detokenizes the token ids."""
 
-import asyncio
 import dataclasses
-import inspect
-from typing import List
+import logging
+from collections import OrderedDict
+from typing import List, Union
 
-import uvloop
 import zmq
-import zmq.asyncio
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    UpdateWeightReqOutput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR
+from sglang.srt.managers.schedule_batch import FINISH_MATCHED_STR, FINISH_MATCHED_TOKEN
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import configure_logger, kill_parent_process
 from sglang.utils import find_printable_text, get_exception_traceback
 
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
 class DecodeStatus:
+    """Store the status of incremental decoding."""
+
     vid: int
     decoded_text: str
     decode_ids: List[int]
@@ -47,17 +49,20 @@ class DecodeStatus:
 
 
 class DetokenizerManager:
+    """DetokenizerManager is a process that detokenizes the token ids."""
+
     def __init__(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        context = zmq.asyncio.Context(2)
-        self.recv_from_router = context.socket(zmq.PULL)
-        self.recv_from_router.bind(f"tcp://127.0.0.1:{port_args.detokenizer_port}")
+        # Init inter-process communication
+        context = zmq.Context(2)
+        self.recv_from_scheduler = context.socket(zmq.PULL)
+        self.recv_from_scheduler.bind(f"ipc://{port_args.detokenizer_ipc_name}")
 
         self.send_to_tokenizer = context.socket(zmq.PUSH)
-        self.send_to_tokenizer.connect(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
+        self.send_to_tokenizer.connect(f"ipc://{port_args.tokenizer_ipc_name}")
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
@@ -68,13 +73,31 @@ class DetokenizerManager:
                 trust_remote_code=server_args.trust_remote_code,
             )
 
-        self.decode_status = {}
+        self.decode_status = LimitedCapacityDict()
 
-    async def handle_loop(self):
+    def trim_eos(self, output: Union[str, List[int]], finished_reason, no_stop_trim):
+        if no_stop_trim:
+            return output
+
+        # Trim stop str. TODO(lmzheng): handle the case where multiple stop strs are hit
+        if isinstance(finished_reason, FINISH_MATCHED_STR) and isinstance(output, str):
+            pos = output.find(finished_reason.matched)
+            return output[:pos] if pos != -1 else output
+        if isinstance(finished_reason, FINISH_MATCHED_TOKEN) and isinstance(
+            output, list
+        ):
+            assert len(output) > 0
+            return output[:-1]
+        return output
+
+    def event_loop(self):
+        """The event loop that handles requests"""
+
         while True:
-            recv_obj: BatchTokenIDOut = await self.recv_from_router.recv_pyobj()
+            recv_obj = self.recv_from_scheduler.recv_pyobj()
 
             if isinstance(recv_obj, BatchEmbeddingOut):
+                # If it is embedding model, no detokenization is needed.
                 self.send_to_tokenizer.send_pyobj(
                     BatchEmbeddingOut(
                         rids=recv_obj.rids,
@@ -84,14 +107,17 @@ class DetokenizerManager:
                     )
                 )
                 continue
+            elif isinstance(recv_obj, UpdateWeightReqOutput):
+                # If it is a weight update request, no detokenization is needed.
+                self.send_to_tokenizer.send_pyobj(recv_obj)
+                continue
+            elif self.tokenizer is None:
+                # If the tokenizer is skipped, no detokenization is needed
+                self.send_to_tokenizer.send_pyobj(recv_obj)
+                continue
 
             assert isinstance(recv_obj, BatchTokenIDOut)
             bs = len(recv_obj.rids)
-
-            if self.tokenizer is None:
-                # Send BatchTokenIDOut if no tokenizer init'ed.
-                self.send_to_tokenizer.send_pyobj(recv_obj)
-                continue
 
             # Initialize decode status
             read_ids, surr_ids = [], []
@@ -111,7 +137,13 @@ class DetokenizerManager:
                     s = self.decode_status[rid]
                     s.decode_ids = recv_obj.decode_ids[i]
 
-                read_ids.append(s.decode_ids[s.surr_offset :])
+                read_ids.append(
+                    self.trim_eos(
+                        s.decode_ids[s.surr_offset :],
+                        recv_obj.finished_reason[i],
+                        recv_obj.no_stop_trim[i],
+                    )
+                )
                 surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
             # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
@@ -126,8 +158,7 @@ class DetokenizerManager:
                 spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
             )
 
-            # Trim stop str
-            # TODO(lmzheng): handle the case where multiple stop strs are hit
+            # Incremental decoding
             output_strs = []
             for i in range(bs):
                 s = self.decode_status[recv_obj.rids[i]]
@@ -142,12 +173,13 @@ class DetokenizerManager:
                     else:
                         new_text = find_printable_text(new_text)
 
-                output_strs.append(s.decoded_text + new_text)
-
-                if isinstance(recv_obj.finished_reason[i], FINISH_MATCHED_STR):
-                    pos = output_strs[i].find(recv_obj.finished_reason[i].matched)
-                    if pos != -1:
-                        output_strs[i] = output_strs[i][:pos]
+                output_strs.append(
+                    self.trim_eos(
+                        s.decoded_text + new_text,
+                        recv_obj.finished_reason[i],
+                        recv_obj.no_stop_trim[i],
+                    )
+                )
 
             self.send_to_tokenizer.send_pyobj(
                 BatchStrOut(
@@ -159,16 +191,29 @@ class DetokenizerManager:
             )
 
 
-def start_detokenizer_process(
+class LimitedCapacityDict(OrderedDict):
+    def __init__(self, capacity=1 << 15, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.capacity = capacity
+
+    def __setitem__(self, key, value):
+        if len(self) >= self.capacity:
+            # Remove the oldest element (first item in the dict)
+            self.popitem(last=False)
+        # Set the new item
+        super().__setitem__(key, value)
+
+
+def run_detokenizer_process(
     server_args: ServerArgs,
     port_args: PortArgs,
-    pipe_writer,
 ):
+    configure_logger(server_args)
+
     try:
         manager = DetokenizerManager(server_args, port_args)
+        manager.event_loop()
     except Exception:
-        pipe_writer.send(get_exception_traceback())
-        raise
-    pipe_writer.send("init ok")
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(manager.handle_loop())
+        msg = get_exception_traceback()
+        logger.error(msg)
+        kill_parent_process()

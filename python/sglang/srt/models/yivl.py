@@ -20,14 +20,10 @@ from typing import Iterable, Optional, Tuple
 import torch
 import torch.nn as nn
 from transformers import CLIPVisionModel, LlavaConfig
-from vllm.config import CacheConfig
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.models.llava import (
-    LlavaLlamaForCausalLM,
-    monkey_path_clip_vision_embed_forward,
-)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.models.llava import LlavaLlamaForCausalLM
 
 
 class YiVLForCausalLM(LlavaLlamaForCausalLM):
@@ -35,7 +31,7 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
         self,
         config: LlavaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ) -> None:
         super().__init__(config, quant_config, cache_config)
 
@@ -50,7 +46,7 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
             self.config._name_or_path,
             torch_dtype=torch.float16,
             subfolder=self.vision_tower_subfolder,
-        ).cuda()
+        ).to("cuda")
 
         self.vision_tower.eval()
 
@@ -93,8 +89,6 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
 
         # load language model
         self.language_model.load_weights(weights)
-
-        monkey_path_clip_vision_embed_forward()
 
 
 class YiVLMultiModalProjector(nn.Module):

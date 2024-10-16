@@ -25,11 +25,11 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 @dataclasses.dataclass
-class LogitProcessorOutput:
+class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     next_token_logits: torch.Tensor
     # The logprobs of the next tokens.     shape: [#seq, vocab_size]
@@ -37,7 +37,7 @@ class LogitProcessorOutput:
 
     # The normlaized logprobs of prompts.  shape: [#seq]
     normalized_prompt_logprobs: torch.Tensor
-    # The logprobs of input tokens.      shape: [#token, vocab_size]
+    # The logprobs of input tokens.        shape: [#token, vocab_size]
     input_token_logprobs: torch.Tensor
 
     # The logprob and id of the top-k tokens in input positions.  shape [#seq, #token, k] of Tuple(logprob, token_id)
@@ -49,90 +49,115 @@ class LogitProcessorOutput:
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode
+    top_logprobs_nums: Optional[List[int]]
+
     return_logprob: bool = False
+    return_top_logprob: bool = False
 
     extend_seq_lens: Optional[torch.Tensor] = None
-    extend_start_loc: Optional[torch.Tensor] = None
-    top_logprobs_nums: Optional[List[int]] = None
+    extend_seq_lens_cpu: Optional[List[int]] = None
+
+    extend_logprob_start_lens_cpu: Optional[List[int]] = None
+    extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
 
     @classmethod
-    def from_input_metadata(cls, input_metadata: InputMetadata):
+    def from_forward_batch(cls, forward_batch: ForwardBatch):
+        if forward_batch.return_logprob:
+            return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
+        else:
+            return_top_logprob = False
+
+        if forward_batch.forward_mode.is_extend():
+            extend_logprob_pruned_lens_cpu = [
+                extend_len - start_len
+                for extend_len, start_len in zip(
+                    forward_batch.extend_seq_lens,
+                    forward_batch.extend_logprob_start_lens_cpu,
+                )
+            ]
+        else:
+            extend_logprob_pruned_lens_cpu = None
         return cls(
-            forward_mode=input_metadata.forward_mode,
-            extend_seq_lens=input_metadata.extend_seq_lens,
-            extend_start_loc=input_metadata.extend_start_loc,
-            return_logprob=input_metadata.return_logprob,
-            top_logprobs_nums=input_metadata.top_logprobs_nums,
+            forward_mode=forward_batch.forward_mode,
+            top_logprobs_nums=forward_batch.top_logprobs_nums,
+            return_logprob=forward_batch.return_logprob,
+            return_top_logprob=return_top_logprob,
+            extend_seq_lens=forward_batch.extend_seq_lens,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
+            extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
         )
 
 
 class LogitsProcessor(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, skip_all_gather: bool = False):
         super().__init__()
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.do_tensor_parallel_all_gather = (
+            not skip_all_gather and get_tensor_model_parallel_world_size() > 1
+        )
 
     def _get_normalized_prompt_logprobs(
-        self, input_token_logprobs, logits_metadata: LogitsMetadata
+        self,
+        input_token_logprobs: torch.Tensor,
+        logits_metadata: LogitsMetadata,
     ):
         logprobs_cumsum = torch.cumsum(input_token_logprobs, dim=0, dtype=torch.float32)
+        pruned_lens = torch.tensor(
+            logits_metadata.extend_logprob_pruned_lens_cpu, device="cuda"
+        )
 
-        start = logits_metadata.extend_start_loc.clone()
-        end = start + logits_metadata.extend_seq_lens - 2
-        start.clamp_(min=0, max=input_token_logprobs.shape[0] - 1)
-        end.clamp_(min=0, max=input_token_logprobs.shape[0] - 1)
+        start = torch.zeros_like(pruned_lens)
+        start[1:] = torch.cumsum(pruned_lens[:-1], dim=0)
+        end = torch.clamp(
+            start + pruned_lens - 2, min=0, max=logprobs_cumsum.shape[0] - 1
+        )
         sum_logp = (
             logprobs_cumsum[end] - logprobs_cumsum[start] + input_token_logprobs[start]
         )
-        normalized_prompt_logprobs = sum_logp / (
-            (logits_metadata.extend_seq_lens - 1).clamp(min=1)
-        )
-
+        normalized_prompt_logprobs = sum_logp / (pruned_lens - 1).clamp(min=1)
         return normalized_prompt_logprobs
 
     @staticmethod
-    def get_top_logprobs(all_logprobs, logits_metadata: LogitsMetadata):
-        if logits_metadata.forward_mode == ForwardMode.DECODE:
+    def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
+        max_k = max(logits_metadata.top_logprobs_nums)
+        ret = all_logprobs.topk(max_k, dim=1)
+        values = ret.values.tolist()
+        indices = ret.indices.tolist()
+
+        if logits_metadata.forward_mode.is_decode():
             output_top_logprobs = []
-            max_k = max(logits_metadata.top_logprobs_nums)
-            ret = all_logprobs.topk(max_k, dim=1)
-            values = ret.values.tolist()
-            indices = ret.indices.tolist()
             for i, k in enumerate(logits_metadata.top_logprobs_nums):
                 output_top_logprobs.append(list(zip(values[i][:k], indices[i][:k])))
             return None, output_top_logprobs
         else:
-            # TODO: vectorize the code below
             input_top_logprobs, output_top_logprobs = [], []
+
             pt = 0
-            extend_seq_lens_cpu = logits_metadata.extend_seq_lens.tolist()
-
-            max_k = max(logits_metadata.top_logprobs_nums)
-            ret = all_logprobs.topk(max_k, dim=1)
-            values = ret.values.tolist()
-            indices = ret.indices.tolist()
-
-            for i, extend_seq_len in enumerate(extend_seq_lens_cpu):
-                if extend_seq_len == 0:
+            for k, pruned_len in zip(
+                logits_metadata.top_logprobs_nums,
+                logits_metadata.extend_logprob_pruned_lens_cpu,
+            ):
+                if pruned_len <= 0:
                     input_top_logprobs.append([])
                     output_top_logprobs.append([])
                     continue
-                k = logits_metadata.top_logprobs_nums[i]
+
                 input_top_logprobs.append(
                     [
                         list(zip(values[pt + j][:k], indices[pt + j][:k]))
-                        for j in range(extend_seq_len - 1)
+                        for j in range(pruned_len - 1)
                     ]
                 )
                 output_top_logprobs.append(
                     list(
                         zip(
-                            values[pt + extend_seq_len - 1][:k],
-                            indices[pt + extend_seq_len - 1][:k],
+                            values[pt + pruned_len - 1][:k],
+                            indices[pt + pruned_len - 1][:k],
                         )
                     )
                 )
-                pt += extend_seq_len
+                pt += pruned_len
 
             return input_top_logprobs, output_top_logprobs
 
@@ -141,36 +166,33 @@ class LogitsProcessor(nn.Module):
         input_ids,
         hidden_states,
         weight,
-        logits_metadata: Union[LogitsMetadata, InputMetadata],
+        logits_metadata: Union[LogitsMetadata, ForwardBatch],
     ):
-        if isinstance(logits_metadata, InputMetadata):
-            logits_metadata = LogitsMetadata.from_input_metadata(logits_metadata)
+        if isinstance(logits_metadata, ForwardBatch):
+            logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
         assert isinstance(logits_metadata, LogitsMetadata)
 
         # Get the last hidden states and last logits for the next token prediction
-        if logits_metadata.forward_mode == ForwardMode.DECODE:
+        if logits_metadata.forward_mode.is_decode():
             last_index = None
             last_hidden = hidden_states
         else:
-            last_index = (
-                torch.cumsum(logits_metadata.extend_seq_lens, dim=0, dtype=torch.long)
-                - 1
-            )
+            last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             last_hidden = hidden_states[last_index]
 
         last_logits = torch.matmul(last_hidden, weight.T)
-        if self.tp_size > 1:
+        if self.do_tensor_parallel_all_gather:
             last_logits = tensor_model_parallel_all_gather(last_logits)
         last_logits = last_logits[:, : self.config.vocab_size].float()
 
         if hasattr(self.config, "final_logit_softcapping"):
-            last_logits /= self.config.final_logit_softcapping
-            last_logits = torch.tanh(last_logits)
-            last_logits *= self.config.final_logit_softcapping
+            last_logits.div_(self.config.final_logit_softcapping)
+            torch.tanh(last_logits, out=last_logits)
+            last_logits.mul_(self.config.final_logit_softcapping)
 
         # Return only last_logits if logprob is not requested
         if not logits_metadata.return_logprob:
-            return LogitProcessorOutput(
+            return LogitsProcessorOutput(
                 next_token_logits=last_logits,
                 next_token_logprobs=None,
                 normalized_prompt_logprobs=None,
@@ -179,22 +201,16 @@ class LogitsProcessor(nn.Module):
                 output_top_logprobs=None,
             )
         else:
-            # When logprob is requested, compute the logits for all tokens.
-            if logits_metadata.forward_mode == ForwardMode.DECODE:
-                last_logprobs = torch.nn.functional.log_softmax(last_logits, dim=-1)
+            last_logprobs = torch.nn.functional.log_softmax(last_logits, dim=-1)
 
-                # Get the logprob of top-k tokens
-                return_top_logprob = any(
-                    x > 0 for x in logits_metadata.top_logprobs_nums
-                )
-                if return_top_logprob:
+            if logits_metadata.forward_mode.is_decode():
+                if logits_metadata.return_top_logprob:
                     output_top_logprobs = self.get_top_logprobs(
                         last_logprobs, logits_metadata
                     )[1]
                 else:
                     output_top_logprobs = None
-
-                return LogitProcessorOutput(
+                return LogitsProcessorOutput(
                     next_token_logits=last_logits,
                     next_token_logprobs=last_logprobs,
                     normalized_prompt_logprobs=None,
@@ -203,45 +219,57 @@ class LogitsProcessor(nn.Module):
                     output_top_logprobs=output_top_logprobs,
                 )
             else:
-                all_logits = torch.matmul(hidden_states, weight.T)
-                if self.tp_size > 1:
+                # Slice the requested tokens to compute logprob
+                pt, states, pruned_input_ids = 0, [], []
+                for start_len, extend_len in zip(
+                    logits_metadata.extend_logprob_start_lens_cpu,
+                    logits_metadata.extend_seq_lens_cpu,
+                ):
+                    states.append(hidden_states[pt + start_len : pt + extend_len])
+                    pruned_input_ids.append(input_ids[pt + start_len : pt + extend_len])
+                    pt += extend_len
+
+                # Compute the logits and logprobs for all required tokens
+                states = torch.cat(states, dim=0)
+                all_logits = torch.matmul(states, weight.T)
+                if self.do_tensor_parallel_all_gather:
                     all_logits = tensor_model_parallel_all_gather(all_logits)
                 all_logits = all_logits[:, : self.config.vocab_size].float()
 
                 if hasattr(self.config, "final_logit_softcapping"):
-                    all_logits /= self.config.final_logit_softcapping
-                    all_logits = torch.tanh(all_logits)
-                    all_logits *= self.config.final_logit_softcapping
+                    all_logits.div_(self.config.final_logit_softcapping)
+                    torch.tanh(all_logits, out=all_logits)
+                    all_logits.mul_(self.config.final_logit_softcapping)
 
                 all_logprobs = all_logits
                 del all_logits, hidden_states
                 all_logprobs[:] = torch.nn.functional.log_softmax(all_logprobs, dim=-1)
 
                 # Get the logprob of top-k tokens
-                return_top_logprob = any(
-                    x > 0 for x in logits_metadata.top_logprobs_nums
-                )
-                if return_top_logprob:
+                if logits_metadata.return_top_logprob:
                     input_top_logprobs, output_top_logprobs = self.get_top_logprobs(
                         all_logprobs, logits_metadata
                     )
                 else:
                     input_top_logprobs = output_top_logprobs = None
 
-                last_logprobs = all_logprobs[last_index]
-
-                # Compute the logprobs and normalized logprobs for the prefill tokens.
-                # Note that we pad a zero at the end of each sequence for easy computation.
+                # Compute the normalized logprobs for the requested tokens.
+                # Note that we pad a zero at the end for easy batching.
                 input_token_logprobs = all_logprobs[
                     torch.arange(all_logprobs.shape[0], device="cuda"),
-                    torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
+                    torch.cat(
+                        [
+                            torch.cat(pruned_input_ids)[1:],
+                            torch.tensor([0], device="cuda"),
+                        ]
+                    ),
                 ]
-
                 normalized_prompt_logprobs = self._get_normalized_prompt_logprobs(
-                    input_token_logprobs, logits_metadata
+                    input_token_logprobs,
+                    logits_metadata,
                 )
 
-                return LogitProcessorOutput(
+                return LogitsProcessorOutput(
                     next_token_logits=last_logits,
                     next_token_logprobs=last_logprobs,
                     normalized_prompt_logprobs=normalized_prompt_logprobs,

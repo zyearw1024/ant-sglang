@@ -6,11 +6,12 @@ import time
 
 import numpy as np
 
+from sglang.api import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
 )
-from sglang.utils import dump_state_text, read_jsonl
+from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
 
 INVALID = -9999999
 
@@ -41,15 +42,22 @@ def get_answer_value(answer_str):
 
 
 def main(args):
-    lines = read_jsonl(args.data_path)
+    # Select backend
+    set_default_backend(select_sglang_backend(args))
+
+    # Read data
+    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+    filename = download_and_cache_file(url)
+    lines = list(read_jsonl(filename))
 
     # Construct prompts
-    k = args.num_shot
-    few_shot_examples = get_few_shot_examples(lines, k)
+    num_questions = args.num_questions
+    num_shots = args.num_shots
+    few_shot_examples = get_few_shot_examples(lines, num_shots)
 
     questions = []
     labels = []
-    for i in range(len(lines[: args.num_questions])):
+    for i in range(len(lines[:num_questions])):
         questions.append(get_one_example(lines, i, False))
         labels.append(get_answer_value(lines[i]["answer"]))
     assert all(l != INVALID for l in labels)
@@ -64,21 +72,19 @@ def main(args):
     @sgl.function
     def few_shot_gsm8k(s, question):
         s += few_shot_examples + question
-        s += sgl.gen("answer", max_tokens=512, stop="Question")
+        s += sgl.gen(
+            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+        )
 
     #####################################
     ########## SGL Program End ##########
     #####################################
-
-    # Select backend
-    backend = select_sglang_backend(args)
 
     # Run requests
     tic = time.time()
     states = few_shot_gsm8k.run_batch(
         arguments,
         temperature=0,
-        backend=backend,
         num_threads=args.parallel,
         progress_bar=True,
     )
@@ -88,14 +94,26 @@ def main(args):
     for i in range(len(states)):
         preds.append(get_answer_value(states[i]["answer"]))
 
+    # print(f"{preds=}")
+    # print(f"{labels=}")
+
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
     invalid = np.mean(np.array(preds) == INVALID)
-    print(f"Latency: {latency:.3f}")
-    print(f"Invalid: {invalid:.3f}")
-    print(f"Accuracy: {acc:.3f}")
 
-    # Write results
+    # Compute speed
+    num_output_tokens = sum(
+        s.get_meta_info("answer")["completion_tokens"] for s in states
+    )
+    output_throughput = num_output_tokens / latency
+
+    # Print results
+    print(f"Accuracy: {acc:.3f}")
+    print(f"Invalid: {invalid:.3f}")
+    print(f"Latency: {latency:.3f} s")
+    print(f"Output throughput: {output_throughput:.3f} token/s")
+
+    # Dump results
     dump_state_text(f"tmp_output_{args.backend}.txt", states)
 
     with open(args.result_file, "a") as fout:
@@ -116,7 +134,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-shot", type=int, default=5)
+    parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--num-questions", type=int, default=200)
     args = add_common_sglang_args_and_parse(parser)
