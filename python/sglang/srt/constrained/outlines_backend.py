@@ -20,7 +20,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import interegular
 import torch
 from outlines.fsm.guide import RegexGuide
-from outlines.fsm.json_schema import build_regex_from_schema
 from outlines.models.transformers import TransformerTokenizer
 from pydantic import BaseModel
 
@@ -29,6 +28,18 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
 )
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
+from sglang.srt.utils import is_hip
+
+is_hip_ = is_hip()
+
+if is_hip_:
+    from outlines_core.fsm.json_schema import build_regex_from_schema
+else:
+    try:
+        from outlines.fsm.json_schema import build_regex_from_schema
+    except ImportError:
+        from outlines_core.fsm.json_schema import build_regex_from_schema
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +53,7 @@ class OutlinesGrammar(BaseGrammarObject):
         self.guide = guide
         self.jump_forward_map = jump_forward_map
         self.state = 0
+        self.finished = False
 
     def accept_token(self, token: int):
         self.state = self.guide.get_next_state(self.state, token)
@@ -83,6 +95,10 @@ class OutlinesGrammar(BaseGrammarObject):
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
         return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         tokens = torch.tensor(
@@ -152,7 +168,12 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             raise ValueError(f"Invalid key_type: {key_type}")
 
         try:
-            guide = RegexGuide(regex, self.outlines_tokenizer)
+            if hasattr(RegexGuide, "from_regex"):
+                # outlines >= 0.1.1
+                guide = RegexGuide.from_regex(regex, self.outlines_tokenizer)
+            else:
+                # outlines <= 0.0.46
+                guide = RegexGuide(regex, self.outlines_tokenizer)
         except interegular.patterns.InvalidSyntax as e:
             logger.warning(f"skip invalid regex schema: {regex=}, {e=}")
             return None

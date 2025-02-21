@@ -26,6 +26,8 @@ from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import ValidationError
 
+from sglang.lang.chat_template import get_chat_template_by_model_path
+
 try:
     from outlines.fsm.json_schema import convert_json_schema_to_str
 except ImportError:
@@ -40,6 +42,7 @@ from sglang.srt.conversation import (
     generate_chat_conv,
     register_conv_template,
 )
+from sglang.srt.function_call_parser import TOOLS_TAG_LIST, FunctionCallParser
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
@@ -65,7 +68,9 @@ from sglang.srt.openai_api.protocol import (
     FileDeleteResponse,
     FileRequest,
     FileResponse,
+    FunctionResponse,
     LogProbs,
+    ToolCall,
     TopLogprob,
     UsageInfo,
 )
@@ -88,7 +93,6 @@ file_id_request: Dict[str, FileMetadata] = {}
 file_id_response: Dict[str, FileResponse] = {}
 # map file id to file path in SGLang backend
 file_id_storage: Dict[str, str] = {}
-
 
 # backend storage directory
 storage_dir = None
@@ -113,12 +117,13 @@ def create_streaming_error_response(
     return json_str
 
 
-def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
+def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg, model_path):
     global chat_template_name
 
     logger.info(
         f"Use chat template for the OpenAI-compatible API server: {chat_template_arg}"
     )
+
     if not chat_template_exists(chat_template_arg):
         if not os.path.exists(chat_template_arg):
             raise RuntimeError(
@@ -159,6 +164,18 @@ def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
             chat_template_name = template["name"]
     else:
         chat_template_name = chat_template_arg
+
+    # check chat-template
+    chat_template = get_chat_template_by_model_path(model_path)
+    if chat_template is not None:
+        official_chat_template = chat_template.name
+        used_chat_template = chat_template_name
+        if official_chat_template != used_chat_template:
+            logger.warning(
+                f"Using a chat_template: '{used_chat_template}', "
+                f"which is different from official chat template: '{official_chat_template}', "
+                f"This discrepancy may lead to performance degradation."
+            )
 
 
 async def v1_files_create(file: UploadFile, purpose: str, file_storage_pth: str = None):
@@ -306,6 +323,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     ret,
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
+                    tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
                 )
             else:
                 responses = v1_generate_response(
@@ -486,6 +504,7 @@ def v1_generate_request(
     return_logprobs = []
     logprob_start_lens = []
     top_logprobs_nums = []
+    lora_paths = []
 
     for request in all_requests:
         # NOTE: with openai API, the prompt's logprobs are always not computed
@@ -496,6 +515,7 @@ def v1_generate_request(
             )
 
         prompts.append(request.prompt)
+        lora_paths.append(request.lora_path)
         if request.echo and request.logprobs:
             current_logprob_start_len = 0
         else:
@@ -508,18 +528,21 @@ def v1_generate_request(
                 "stop": request.stop,
                 "stop_token_ids": request.stop_token_ids,
                 "top_p": request.top_p,
+                "top_k": request.top_k,
+                "min_p": request.min_p,
                 "presence_penalty": request.presence_penalty,
                 "frequency_penalty": request.frequency_penalty,
                 "repetition_penalty": request.repetition_penalty,
                 "regex": request.regex,
                 "json_schema": request.json_schema,
+                "ebnf": request.ebnf,
                 "n": request.n,
                 "no_stop_trim": request.no_stop_trim,
                 "ignore_eos": request.ignore_eos,
                 "skip_special_tokens": request.skip_special_tokens,
             }
         )
-        return_logprobs.append(request.logprobs is not None and request.logprobs > 0)
+        return_logprobs.append(request.logprobs is not None)
         logprob_start_lens.append(current_logprob_start_len)
         top_logprobs_nums.append(
             request.logprobs if request.logprobs is not None else 0
@@ -534,6 +557,7 @@ def v1_generate_request(
         return_logprobs = return_logprobs[0]
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
+        lora_paths = lora_paths[0]
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
@@ -549,6 +573,7 @@ def v1_generate_request(
         return_text_in_logprobs=True,
         stream=all_requests[0].stream,
         rid=request_ids,
+        lora_path=lora_paths,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
@@ -591,9 +616,9 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
             text = prompts[prompt_index] + text
 
         logprobs = False
-        if isinstance(request, list) and request[idx].logprobs:
+        if isinstance(request, list) and request[idx].logprobs is not None:
             logprobs = True
-        elif (not isinstance(request, list)) and request.logprobs:
+        elif (not isinstance(request, list)) and request.logprobs is not None:
             logprobs = True
         if logprobs:
             if echo:
@@ -735,7 +760,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                             # Prepend prompt in response text.
                             text = prompts + text
 
-                    if request.logprobs:
+                    if request.logprobs is not None:
                         # The first chunk and echo is enabled.
                         if not stream_buffer and request.echo:
                             input_token_logprobs = content["meta_info"][
@@ -852,6 +877,7 @@ def v1_chat_generate_request(
     logprob_start_lens = []
     top_logprobs_nums = []
     modalities_list = []
+    lora_paths = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -863,6 +889,18 @@ def v1_chat_generate_request(
         #    None skips any image processing in GenerateReqInput.
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
+            tools = None
+            if request.tools and request.tool_choice != "none":
+                request.skip_special_tokens = False
+                if not isinstance(request.tool_choice, str):
+                    tools = [
+                        item.function.model_dump()
+                        for item in request.tools
+                        if item.function.name == request.tool_choice.function.name
+                    ]
+                else:
+                    tools = [item.function.model_dump() for item in request.tools]
+
             if chat_template_name is None:
                 openai_compatible_messages = []
                 for message in request.messages:
@@ -882,11 +920,26 @@ def v1_chat_generate_request(
                     openai_compatible_messages = openai_compatible_messages[:-1]
                 else:
                     assistant_prefix = None
-                prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
-                    openai_compatible_messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                )
+
+                try:
+                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=tools,
+                    )
+                except:
+                    #  This except branch will be triggered when the chosen model
+                    #  has a different tools input format that is not compatiable
+                    #  with openAI's apply_chat_template tool_call format, like Mistral.
+                    tools = [t if "function" in t else {"function": t} for t in tools]
+                    prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=tools,
+                    )
+
                 if assistant_prefix:
                     prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
                 stop = request.stop
@@ -914,6 +967,7 @@ def v1_chat_generate_request(
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
+        lora_paths.append(request.lora_path)
 
         sampling_params = {
             "temperature": request.temperature,
@@ -922,10 +976,13 @@ def v1_chat_generate_request(
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
             "top_p": request.top_p,
+            "top_k": request.top_k,
+            "min_p": request.min_p,
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
+            "ebnf": request.ebnf,
             "n": request.n,
             "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
@@ -950,6 +1007,7 @@ def v1_chat_generate_request(
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
+        lora_paths = lora_paths[0]
     else:
         if isinstance(input_ids[0], str):
             prompt_kwargs = {"text": input_ids}
@@ -967,12 +1025,15 @@ def v1_chat_generate_request(
         return_text_in_logprobs=True,
         rid=request_ids,
         modalities=modalities_list,
+        lora_path=lora_paths,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
 
-def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
+def v1_chat_generate_response(
+    request, ret, to_file=False, cache_report=False, tool_call_parser=None
+):
     choices = []
 
     for idx, ret_item in enumerate(ret):
@@ -1019,11 +1080,47 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
 
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
+        tool_calls = None
+        text = ret_item["text"]
+
+        if isinstance(request, list):
+            tool_choice = request[idx].tool_choice
+            tools = request[idx].tools
+        else:
+            tool_choice = request.tool_choice
+            tools = request.tools
+
+        if tool_choice != "none" and any([i in text for i in TOOLS_TAG_LIST]):
+            if finish_reason == "stop":
+                finish_reason = "tool_calls"
+            try:
+                parser = FunctionCallParser(tools, tool_call_parser)
+                full_normal_text, call_info_list = parser.parse_non_stream(text)
+                tool_calls = [
+                    ToolCall(
+                        id=str(call_info.tool_index),
+                        function=FunctionResponse(
+                            name=call_info.name, arguments=call_info.parameters
+                        ),
+                    )
+                    for call_info in call_info_list
+                ]
+            except Exception as e:
+                logger.error(f"Exception: {e}")
+                return create_error_response(
+                    HTTPStatus.BAD_REQUEST,
+                    "Failed to parse fc related info to json format!",
+                )
+
         if to_file:
             # to make the choice data json serializable
             choice_data = {
                 "index": 0,
-                "message": {"role": "assistant", "content": ret_item["text"]},
+                "message": {
+                    "role": "assistant",
+                    "content": ret_item["text"] if tool_calls is None else None,
+                    "tool_calls": tool_calls,
+                },
                 "logprobs": choice_logprobs,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
                 "matched_stop": (
@@ -1035,7 +1132,11 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
         else:
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
-                message=ChatMessage(role="assistant", content=ret_item["text"]),
+                message=ChatMessage(
+                    role="assistant",
+                    content=ret_item["text"] if tool_calls is None else None,
+                    tool_calls=tool_calls,
+                ),
                 logprobs=choice_logprobs,
                 finish_reason=(finish_reason["type"] if finish_reason else ""),
                 matched_stop=(
@@ -1100,6 +1201,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
 
     if adapted_request.stream:
+        parser_dict = {}
 
         async def generate_stream_resp():
             is_firsts = {}
@@ -1112,6 +1214,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     adapted_request, raw_request
                 ):
                     index = content.get("index", 0)
+                    text = content["text"]
 
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
@@ -1191,29 +1294,111 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
                     text = content["text"]
                     delta = text[len(stream_buffer) :]
-                    stream_buffer = stream_buffer + delta
-                    choice_data = ChatCompletionResponseStreamChoice(
-                        index=index,
-                        delta=DeltaMessage(content=delta),
-                        finish_reason=(finish_reason["type"] if finish_reason else ""),
-                        matched_stop=(
-                            finish_reason["matched"]
-                            if finish_reason and "matched" in finish_reason
-                            else None
-                        ),
-                        logprobs=choice_logprobs,
-                    )
-                    chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        choices=[choice_data],
-                        model=request.model,
-                    )
+                    new_stream_buffer = stream_buffer + delta
 
-                    is_firsts[index] = is_first
-                    stream_buffers[index] = stream_buffer
-                    n_prev_tokens[index] = n_prev_token
+                    if request.tool_choice != "none" and request.tools:
+                        if index not in parser_dict:
+                            parser_dict[index] = FunctionCallParser(
+                                tools=request.tools,
+                                tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
+                            )
+                        parser = parser_dict[index]
 
-                    yield f"data: {chunk.model_dump_json()}\n\n"
+                        # parse_increment => returns (normal_text, calls)
+                        normal_text, calls = parser.parse_stream_chunk(delta)
+
+                        # 1) if there's normal_text, output it as normal content
+                        if normal_text:
+                            choice_data = ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(content=normal_text),
+                                finish_reason=(
+                                    finish_reason["type"] if finish_reason else ""
+                                ),
+                            )
+                            chunk = ChatCompletionStreamResponse(
+                                id=content["meta_info"]["id"],
+                                choices=[choice_data],
+                                model=request.model,
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
+
+                        # 2) if we found calls, we output them as separate chunk(s)
+                        for call_item in calls:
+                            # transform call_item -> FunctionResponse + ToolCall
+
+                            if (
+                                content["meta_info"]["finish_reason"]
+                                and content["meta_info"]["finish_reason"]["type"]
+                                == "stop"
+                            ):
+                                latest_delta_len = 0
+                                if isinstance(call_item.parameters, str):
+                                    latest_delta_len = len(call_item.parameters)
+
+                                expected_call = json.dumps(
+                                    parser.multi_format_parser.detectors[0]
+                                    .prev_tool_call_arr[index]
+                                    .get("arguments", {}),
+                                    ensure_ascii=False,
+                                )
+                                actual_call = parser.multi_format_parser.detectors[
+                                    0
+                                ].streamed_args_for_tool[index]
+                                if latest_delta_len > 0:
+                                    actual_call = actual_call[:-latest_delta_len]
+                                remaining_call = expected_call.replace(
+                                    actual_call, "", 1
+                                )
+                                call_item.parameters = remaining_call
+
+                            tool_call = ToolCall(
+                                id=str(call_item.tool_index),
+                                function=FunctionResponse(
+                                    name=call_item.name,
+                                    arguments=call_item.parameters,
+                                ),
+                            )
+                            choice_data = ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(
+                                    role="assistant", tool_calls=[tool_call]
+                                ),
+                                finish_reason="tool_call",
+                            )
+                            chunk = ChatCompletionStreamResponse(
+                                id=content["meta_info"]["id"],
+                                choices=[choice_data],
+                                model=request.model,
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
+
+                        stream_buffers[index] = new_stream_buffer
+                        is_firsts[index] = is_first
+
+                    else:
+                        # No tool calls => just treat this as normal text
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(content=delta),
+                            finish_reason=(
+                                finish_reason["type"] if finish_reason else ""
+                            ),
+                            matched_stop=(
+                                finish_reason["matched"]
+                                if finish_reason and "matched" in finish_reason
+                                else None
+                            ),
+                            logprobs=choice_logprobs,
+                        )
+                        chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            choices=[choice_data],
+                            model=request.model,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        stream_buffers[index] = new_stream_buffer
+                        is_firsts[index] = is_first
                 if request.stream_options and request.stream_options.include_usage:
                     total_prompt_tokens = sum(
                         tokens
@@ -1261,7 +1446,10 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
         ret = [ret]
 
     response = v1_chat_generate_response(
-        request, ret, cache_report=tokenizer_manager.server_args.enable_cache_report
+        request,
+        ret,
+        cache_report=tokenizer_manager.server_args.enable_cache_report,
+        tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
     )
 
     return response
@@ -1275,7 +1463,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
     for request in all_requests:
         prompt = request.input
         assert (
-            type(prompt) == first_prompt_type
+            type(prompt) is first_prompt_type
         ), "All prompts must be of the same type in file input settings"
         prompts.append(prompt)
 
@@ -1286,7 +1474,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
         else:
             prompt_kwargs = {"input_ids": prompt}
     else:
-        if isinstance(prompts[0], str) or isinstance(propmts[0][0], str):
+        if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
         else:
             prompt_kwargs = {"input_ids": prompts}
