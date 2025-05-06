@@ -3,15 +3,17 @@
 from sglang.patch.monkey_patch_launch_server import patch_all
 
 patch_all()  # noqa: E702
-import argparse
+import os
+import sys
 
-from sglang.srt.server import launch_server
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.server_args import prepare_server_args
+from sglang.srt.utils import kill_process_tree
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
-    args = parser.parse_args()
-    server_args = ServerArgs.from_cli_args(args)
+    server_args = prepare_server_args(sys.argv[1:])
 
-    launch_server(server_args)
+    try:
+        launch_server(server_args)
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)
