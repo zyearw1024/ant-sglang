@@ -1,4 +1,4 @@
-ARG CUDA_VERSION=12.4.1
+ARG CUDA_VERSION=12.8.1
 
 FROM nvcr.io/nvidia/tritonserver:24.04-py3-min
 
@@ -8,9 +8,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
     && apt update -y \
-    && apt install software-properties-common -y \
-    && apt install python3 python3-pip -y \
-    && apt install curl git sudo libibverbs-dev -y \
+    && apt install software-properties-common curl -y \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt update -y \
+    && apt install python3.12 python3.12-dev python3.12-venv -y \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && apt install git sudo libibverbs-dev -y \
     && apt install rdma-core infiniband-diags openssh-server perftest -y \
     && python3 --version \
     && python3 -m pip --version \
@@ -24,13 +28,16 @@ WORKDIR /sgl-workspace
 
 COPY . /sgl-workspace/sglang
 ARG CUDA_VERSION
+
 RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && if [ "$CUDA_VERSION" = "12.1.1" ]; then \
          export CUINDEX=121; \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
          export CUINDEX=124; \
+       elif [ "$CUDA_VERSION" = "12.6.1" ]; then \
+         export CUINDEX=126; \
        elif [ "$CUDA_VERSION" = "12.8.1" ]; then \
-         export CUINDEX=124; \
+         export CUINDEX=128; \
        elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
          export CUINDEX=118; \
          python3 -m pip install --no-cache-dir sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
@@ -41,7 +48,8 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && cd sglang \
     && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" --find-links https://flashinfer.ai/whl/cu${CUINDEX}/torch2.6/flashinfer-python \
     && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-         python3 -m pip install nvidia-nccl-cu12==2.26.2.post1 --force-reinstall --no-deps; \
+         python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.3 --force-reinstall --no-deps; \
+         python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.0/sgl_kernel-0.2.0+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps; \
        fi
 # awq quantization requires some operators from vllm
 RUN python3 -m pip install vllm>=0.8.4
@@ -51,5 +59,10 @@ RUN python3 -m pip cache purge
 ENV DEBIAN_FRONTEND=interactive
 ENV TZ=Asia/Shanghai
 
-# build 2025-05-06  
-# docker build --progress=plain -f docker/Dockerfile.cuda.patch --build-arg CUDA_VERSION=12.4.1 -t ant_sglang:cuda_124_v0.4.6.1_$(date +"%Y%m%d") .
+# build 2025-06-23
+# Example build commands:
+# Step 1: Get version number
+# export SGLANG_VERSION=$(python3 -c "import sys; sys.path.append('./python'); from sglang.version import __version__; print(__version__ + '.1')")
+ 
+# Step 2: Build docker image
+# docker build --progress=plain -f docker/Dockerfile.cuda.patch --build-arg CUDA_VERSION=12.8.1 -t ant_sglang:cuda_128_v${SGLANG_VERSION}_$(date +"%Y%m%d") .
